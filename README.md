@@ -1,2 +1,3 @@
-# JavierArenasVillanueva_TFM
-Código del TFM para el análisis de expresión génica en cáncer de mama y clasificación del grado histológico G1/G2/G3 usando datos GEO, selección de probesets y modelos de aprendizaje automático.
+# JavierArenasVillanueva TFM
+
+Código del TFM del Máster en Data Science de la Universitat Oberta de Catalunya, curso 2025-2026, centrado en el análisis de expresión génica en cáncer de mama y la clasificación del grado histológico mediante aprendizaje automático.
