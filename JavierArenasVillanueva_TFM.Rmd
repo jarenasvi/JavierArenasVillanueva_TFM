@@ -1,0 +1,2162 @@
+---
+title: "Estudio de la expresión génica vinculada al grado histológico en tumores de mama"
+author: "Javier Arenas Villanueva"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{=html}
+<style>
+body {
+  font-family: "Times New Roman", Times, serif;
+  text-align: justify;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: "Times New Roman", Times, serif;
+  text-align: left;
+}
+
+table {
+  font-family: "Times New Roman", Times, serif;
+}
+</style>
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE
+)
+```
+
+# Introducción
+
+El objetivo de este Trabajo de Fin de Máster es obtener un método que
+permita realizar la clasificación del grado histológico de muestras
+tumorales de mama a partir de datos de expresión génica obtenidos de la
+base de datos GEO. Para ello, se emplea un conjunto de datos principal
+(GSE4922), utilizado para el desarrollo y entrenamiento de los modelos,
+y un segundo conjunto independiente (GSE2990), reservado para realizar
+una validación externa del sistema.
+
+Antes de construir los modelos de clasificación, ambos conjuntos de
+datos se procesan de forma conjunta con el fin de garantizar que las
+muestras sean comparables entre sí, evitando el *batch effect*. En
+primer lugar, se selecciona la misma plataforma de microarrays en ambos
+estudios (GPL96 - Affymetrix Human Genome U133A Array) y se conservan
+únicamente los probesets comunes. Posteriormente, se aplica el método
+ComBat.
+
+Una vez corregidos los datos, el conjunto original se utiliza para
+llevar a cabo el entrenamiento, selección de características y
+comparación de distintos modelos de clasificación. Finalmente, el
+conjunto externo se reserva para evaluar la capacidad de generalización
+del modelo seleccionado sobre los datos externos.
+
+# Preparación del entorno de trabajo
+
+Antes de comenzar el análisis de los datos, se configura el entorno de
+trabajo para llevar a cabo el análisis. Por un lado, se importan las
+librerías esenciales para realizarlo. Por otro lado, se establecen los
+parámetros generales que se aplicarán en el proceso, como los
+identificadores de los conjuntos de datos utilizados, la plataforma
+común elegida para trabajar de los estudios y la semilla empleada para
+garantizar la reproducibilidad de los resultados.
+
+```{r librerias, message=FALSE, warning=FALSE}
+library(GEOquery)
+library(Biobase)
+library(sva)
+library(ggplot2)
+library(caret)
+library(pheatmap)
+library(mRMRe)
+library(glmnet)
+library(kernlab)
+library(randomForest)
+library(MASS)
+```
+
+```{r parametros_generales, warning=TRUE}
+seed <- 123
+
+# Identificadores de los conjuntos de datos
+gse_original_id <- "GSE4922"
+gse_externo_id  <- "GSE2990"
+
+# Plataforma común utilizada en ambos estudios
+plataforma_usada <- "GPL96"
+
+set.seed(seed)
+```
+
+# Descarga y selección de los conjuntos de datos
+
+Una vez definido el entorno de trabajo, se procede a la descarga de los
+conjuntos de datos que se utilizan en el análisis. En este caso, se
+emplea el conjunto **GSE4922** como base para el desarrollo de los
+modelos y el conjunto **GSE2990** como conjunto externo para la
+posterior validación externa.
+
+Los estudios pueden tener información procedente de distintas
+plataformas de microarrays. Por este motivo, este aspecto se tiene en
+cuenta durante la selección de los datos, escogiendo únicamente la
+plataforma **GPL96**, correspondiente a Affymetrix Human Genome U133A
+Array.
+
+En este caso, los datos se descargan desde GEO a partir del archivo
+**Series Matrix**, que contiene la matriz de expresión procesada junto
+con los metadatos asociados a las muestras.
+
+## GSE4922
+
+```{r datos_GSE4922}
+# Descargamos el conjunto de datos GSE4922
+gse_GSE4922 <- getGEO(gse_original_id, GSEMatrix = TRUE)
+```
+
+```{r}
+# Seleccionamos la plataforma GPL96 en GSE4922
+idx_gpl96_GSE4922 <- which(sapply(gse_GSE4922, annotation) == plataforma_usada)
+gpl96_GSE4922 <- gse_GSE4922[[idx_gpl96_GSE4922[1]]]
+```
+
+```{r}
+# Obtenemos la matriz de expresión de GSE4922
+expr_raw_GSE4922 <- exprs(gpl96_GSE4922)
+```
+
+```{r}
+# Obtenemos la información de la variable objetivo (grado histológico)
+grade_raw_GSE4922 <- as.character(pData(gpl96_GSE4922)$characteristics_ch1.1)
+grade_num_GSE4922 <- as.numeric(gsub("[^0-9]", "", grade_raw_GSE4922))
+
+# Convertimos el grado histológico en una variable categórica
+grade_GSE4922 <- factor(
+  grade_num_GSE4922,
+  levels = c(1, 2, 3),
+  labels = c("G1", "G2", "G3")
+)
+```
+
+## GSE2990
+
+```{r datos_GSE2990}
+# Descargamos el conjunto de datos GSE2990
+gse_GSE2990 <- getGEO(gse_externo_id, GSEMatrix = TRUE)
+```
+
+```{r}
+# Seleccionamos la plataforma GPL96 en GSE2990
+idx_gpl96_GSE2990 <- which(sapply(gse_GSE2990, annotation) == plataforma_usada)
+gpl96_GSE2990 <- gse_GSE2990[[idx_gpl96_GSE2990[1]]]
+```
+
+```{r}
+# Obtenemos la matriz de expresión de GSE2990
+expr_raw_GSE2990 <- exprs(gpl96_GSE2990)
+```
+
+```{r}
+# Obtenemos la información de la variable objetivo (grado histológico)
+grade_raw_GSE2990 <- as.character(pData(gpl96_GSE2990)[["grade:ch1"]])
+grade_num_GSE2990 <- as.numeric(gsub("[^0-9]", "", grade_raw_GSE2990))
+
+# Convertimos el grado histológico en una variable categórica
+grade_GSE2990 <- factor(
+  grade_num_GSE2990,
+  levels = c(1, 2, 3),
+  labels = c("G1", "G2", "G3")
+)
+```
+
+Una vez tenemos los datos de ambos estudios, preparamos las matrices y
+comprobamos tanto la dimensión como la distribución de los grados en
+ambos estudios.
+
+```{r preparacion_inicial_matrices}
+# Transponemos la matriz de GSE4922 para tener muestras en filas y probesets en columnas
+expr_GSE4922 <- as.data.frame(
+  t(expr_raw_GSE4922),
+  check.names = FALSE
+)
+
+# Transponemos la matriz de GSE2990 para tener muestras en filas y probesets en columnas
+expr_GSE2990 <- as.data.frame(
+  t(expr_raw_GSE2990),
+  check.names = FALSE
+)
+
+# Identificamos las muestras con grado histológico válido en GSE4922
+keep_GSE4922 <- !is.na(grade_GSE4922)
+
+# Filtramos las muestras válidas de GSE4922
+expr_GSE4922 <- expr_GSE4922[keep_GSE4922, , drop = FALSE]
+grade_GSE4922 <- droplevels(grade_GSE4922[keep_GSE4922])
+
+# Identificamos las muestras con grado histológico válido en GSE2990
+keep_GSE2990 <- !is.na(grade_GSE2990)
+
+# Filtramos las muestras válidas de GSE2990
+expr_GSE2990 <- expr_GSE2990[keep_GSE2990, , drop = FALSE]
+grade_GSE2990 <- droplevels(grade_GSE2990[keep_GSE2990])
+
+# Comprobamos las dimensiones finales de GSE4922
+dim(expr_GSE4922)
+
+# Comprobamos la distribución del grado histológico en GSE4922
+table(grade_GSE4922)
+
+# Comprobamos las dimensiones finales de GSE2990
+dim(expr_GSE2990)
+
+# Comprobamos la distribución del grado histológico en GSE2990
+table(grade_GSE2990)
+```
+
+Tras la preparación inicial de los datos, se puede observar que el
+estudio GSE4922 está formado por 289 muestras y 22.283 probesets. La
+distribución del grado histológico muestra un mayor número de muestras
+de grado G2, con 166 casos, seguido de G1 con 68 muestras y G3 con 55
+muestras. Por otro lado, el conjunto externo GSE2990 está formado por
+172 muestras y el mismo número de probesets, 22.283, al estar basado en
+la misma plataforma. En este caso, la distribución de clases es más
+equilibrada, con 67 muestras de G1, 46 de G2 y 59 de G3.
+
+# Selección de probesets comunes
+
+El análisis se realiza a nivel de ***probeset***, ya que un mismo
+probeset no siempre tiene relación uno a uno con un gen. Por ejemplo, el
+probeset `1007_s_at` está asociado a más de un símbolo génico. En la
+siguiente salida se observa que tiene asociados `DDR1` y `MIR4640`.
+
+```{r ejemplo_anotacion_probeset}
+# Obtenemos la anotación de la plataforma GPL96
+feature_gpl96_GSE4922 <- fData(gpl96_GSE4922)
+
+# Consultamos la anotación del probeset 1007_s_at
+feature_gpl96_GSE4922["1007_s_at", c("ID", "Gene Symbol", "Gene Title")]
+```
+
+Una vez preparadas las matrices de expresión de ambos estudios, se
+identifican los probesets comunes entre GSE4922 y GSE2990. Aunque ambos
+conjuntos proceden de la misma plataforma y presentan el mismo número de
+probesets, este paso permite asegurar que las variables sean exactamente
+las mismas y que se encuentren en el mismo orden antes de combinar los
+datos. De esta forma, se evita introducir errores al unir las matrices y
+se garantiza que cada columna represente el mismo probeset en ambos
+estudios.
+
+```{r probesets_comunes}
+# Identificamos los probesets comunes entre GSE4922 y GSE2990
+probesets_comunes <- intersect(
+  colnames(expr_GSE4922),
+  colnames(expr_GSE2990)
+)
+
+# Comprobamos el número de probesets comunes
+length(probesets_comunes)
+
+# Conservamos únicamente los probesets comunes en GSE4922
+expr_GSE4922_common <- expr_GSE4922[, probesets_comunes, drop = FALSE]
+
+# Conservamos únicamente los probesets comunes en GSE2990
+expr_GSE2990_common <- expr_GSE2990[, probesets_comunes, drop = FALSE]
+
+# Comprobamos las dimensiones de las matrices filtradas
+dim(expr_GSE4922_common)
+dim(expr_GSE2990_common)
+
+# Comprobamos que los probesets están en el mismo orden en ambos estudios
+identical(
+  colnames(expr_GSE4922_common),
+  colnames(expr_GSE2990_common)
+)
+```
+
+La comprobación confirma que ambos estudios comparten **22.283
+probesets**. Al no haber ningún probeset diferente, el conjunto
+**GSE4922** mantiene **289 muestras** y **22.283 variables**, mientras
+que el conjunto **GSE2990** conserva **172 muestras** y el mismo número
+de variables. Además, el resultado `TRUE` indica que los probesets se
+encuentran en el mismo orden en ambos conjuntos, por lo que las matrices
+pueden combinarse de forma segura en los pasos posteriores.
+
+# *batch effect*
+
+## Comprobación del *batch effect*
+
+Antes de aplicar la corrección mediante ComBat, se realiza un análisis
+de componentes principales (PCA) con el objetivo de visualizar si las
+muestras tienden a agruparse en función del estudio de origen. Este paso
+permite comprobar de forma exploratoria la presencia de diferencias
+asociadas al lote (*batch*), en este caso representado por el conjunto
+de datos al que pertenece cada muestra.
+
+Para ello, se combinan las matrices de expresión de GSE4922 y GSE2990, y
+se crea una variable que identifica el origen de cada muestra.
+
+```{r pca_antes_combat}
+# Unimos las matrices de expresión de ambos estudios
+expr_total_antes <- rbind(
+  expr_GSE4922_common,
+  expr_GSE2990_common
+)
+
+# Creamos la variable que indica el estudio de origen de cada muestra
+batch <- factor(c(
+  rep("GSE4922", nrow(expr_GSE4922_common)),
+  rep("GSE2990", nrow(expr_GSE2990_common))
+))
+
+# Creamos la variable biológica correspondiente al grado histológico
+grade_total <- factor(
+  c(as.character(grade_GSE4922), as.character(grade_GSE2990)),
+  levels = c("G1", "G2", "G3")
+)
+
+# Calculamos el PCA antes de aplicar ComBat
+pca_antes <- prcomp(
+  expr_total_antes,
+  center = TRUE,
+  scale. = TRUE
+)
+
+# Calculamos el porcentaje de varianza explicada por cada componente
+var_exp_antes <- round(
+  100 * pca_antes$sdev^2 / sum(pca_antes$sdev^2),
+  2
+)
+
+# Creamos el data frame con los resultados del PCA
+pca_antes_df <- data.frame(
+  PC1 = pca_antes$x[, 1],
+  PC2 = pca_antes$x[, 2],
+  batch = batch,
+  grade = grade_total
+)
+
+# Representamos el PCA antes de aplicar ComBat
+ggplot(pca_antes_df, aes(x = PC1, y = PC2, color = batch)) +
+  geom_point(size = 2.4, alpha = 0.75) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "PCA antes de ComBat",
+    x = paste0("PC1 (", var_exp_antes[1], "%)"),
+    y = paste0("PC2 (", var_exp_antes[2], "%)"),
+    color = "Estudio"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18),
+    axis.title = element_text(face = "bold"),
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  )
+```
+
+En la representación PCA antes de aplicar ComBat se observa una
+separación clara entre las muestras en función del estudio de origen.
+Las muestras de GSE4922 aparecen agrupadas en una región diferente a las
+de GSE2990, especialmente a lo largo del primer componente principal,
+que explica el 49,44 % de la variabilidad total. Esta separación indica
+la presencia de un efecto de lote asociado al conjunto de datos, por lo
+que resulta necesario aplicar una corrección antes de utilizar ambos
+estudios de forma conjunta.
+
+## Corrección del *batch effect* mediante ComBat
+
+Una vez identificada la separación entre estudios, se aplica el método
+ComBat para corregir el efecto de lote asociado al origen de las
+muestras.
+
+```{r combat}
+# Creamos el modelo biológico que queremos conservar durante la corrección
+mod_combat <- model.matrix(~ grade_total)
+
+# Aplicamos ComBat para corregir el efecto de lote
+expr_combat_matrix <- ComBat(
+  dat = t(as.matrix(expr_total_antes)),
+  batch = batch,
+  mod = mod_combat
+)
+
+# Volvemos la matriz corregida al formato muestras por probesets
+expr_combat <- as.data.frame(
+  t(expr_combat_matrix),
+  check.names = FALSE
+)
+
+# Comprobamos las dimensiones de la matriz corregida
+dim(expr_combat)
+```
+
+Tras aplicar ComBat, se repite el análisis de componentes principales
+con la matriz corregida. El objetivo de este paso es comprobar
+visualmente si la corrección ha reducido la separación entre los
+estudios observada antes de aplicar el método.
+
+```{r pca_despues_combat}
+# Calculamos el PCA después de aplicar ComBat
+pca_despues <- prcomp(
+  expr_combat,
+  center = TRUE,
+  scale. = TRUE
+)
+
+# Calculamos el porcentaje de varianza explicada por cada componente
+var_exp_despues <- round(
+  100 * pca_despues$sdev^2 / sum(pca_despues$sdev^2),
+  2
+)
+
+# Creamos el data frame con los resultados del PCA corregido
+pca_despues_df <- data.frame(
+  PC1 = pca_despues$x[, 1],
+  PC2 = pca_despues$x[, 2],
+  batch = batch,
+  grade = grade_total
+)
+
+# Representamos el PCA después de aplicar ComBat
+ggplot(pca_despues_df, aes(x = PC1, y = PC2, color = batch)) +
+  geom_point(size = 2.4, alpha = 0.75) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "PCA después de ComBat",
+    x = paste0("PC1 (", var_exp_despues[1], "%)"),
+    y = paste0("PC2 (", var_exp_despues[2], "%)"),
+    color = "Estudio"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18),
+    axis.title = element_text(face = "bold"),
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  )
+
+```
+
+Después de aplicar ComBat, la representación PCA muestra una reducción
+clara de la separación entre ambos estudios. A diferencia del PCA
+inicial, donde las muestras aparecían agrupadas principalmente según su
+conjunto de origen, tras la corrección se observa una mayor proximidad
+entre GSE4922 y GSE2990. Además, el porcentaje de varianza explicado por
+el primer componente principal disminuye del 49,44 % al 32,48 %, lo que
+indica que parte de la variabilidad asociada al lote ha sido reducida.
+
+Aun así, se mantienen algunos grupos diferenciados y muestras alejadas,
+especialmente dentro del conjunto externo. Esto indica que ComBat reduce
+el efecto de lote, pero no elimina completamente toda la variabilidad
+existente entre los estudios.
+
+### Separación de los conjuntos tras la corrección
+
+Una vez corregido el efecto de lote, la matriz combinada se separa de
+nuevo en los dos conjuntos originales. De esta forma, el conjunto
+GSE4922 se mantiene como base para el entrenamiento, selección de
+características y comparación de modelos, mientras que GSE2990 se
+reserva como conjunto externo para evaluar la capacidad de
+generalización del modelo final.
+
+```{r separacion_conjuntos_corregidos}
+# Recuperamos la matriz corregida correspondiente a GSE4922
+expr <- expr_combat[rownames(expr_GSE4922_common), , drop = FALSE]
+
+# Recuperamos la variable objetivo correspondiente a GSE4922
+grade <- factor(
+  grade_GSE4922,
+  levels = c("G1", "G2", "G3")
+)
+
+# Recuperamos la matriz corregida correspondiente a GSE2990
+expr_validacion_externa <- expr_combat[rownames(expr_GSE2990_common), , drop = FALSE]
+
+# Recuperamos la variable objetivo correspondiente a GSE2990
+grade_validacion_externa <- factor(
+  grade_GSE2990,
+  levels = c("G1", "G2", "G3")
+)
+
+# Comprobamos las dimensiones del conjunto principal corregido
+dim(expr)
+
+# Comprobamos la distribución del grado histológico en el conjunto principal
+table(grade)
+
+# Comprobamos las dimensiones del conjunto externo corregido
+dim(expr_validacion_externa)
+
+# Comprobamos la distribución del grado histológico en el conjunto externo
+table(grade_validacion_externa)
+```
+
+La separación final mantiene correctamente las dimensiones esperadas. El
+conjunto principal **GSE4922** queda formado por **289 muestras** y
+**22.283 probesets**, con una distribución de **68 muestras G1**, **166
+muestras G2** y **55 muestras G3**. Por otro lado, el conjunto externo
+**GSE2990** queda formado por **172 muestras** y **22.283 probesets**,
+con **67 muestras G1**, **46 muestras G2** y **59 muestras G3**.
+
+# División del conjunto principal
+
+Una vez obtenida la matriz corregida del conjunto principal, se divide
+GSE4922 en un subconjunto de entrenamiento y un subconjunto de prueba
+interna. El conjunto de entrenamiento se utilizará para realizar la
+selección de características y ajustar los modelos, mientras que el
+conjunto de prueba interna permitirá evaluar su rendimiento antes de
+aplicarlos sobre la cohorte externa GSE2990.
+
+La partición se realiza de forma estratificada, manteniendo la
+proporción de muestras de cada grado histológico en ambos subconjuntos.
+
+```{r parametros_particion}
+train_prop <- 0.70
+```
+
+```{r particion}
+# Creamos una partición del conjunto principal
+idx_train <- createDataPartition(
+  grade,
+  p = train_prop,
+  list = FALSE
+)
+
+# Obtenemos la matriz de entrenamiento
+expr_train <- expr[idx_train, , drop = FALSE]
+
+# Obtenemos la matriz de prueba interna
+expr_test <- expr[-idx_train, , drop = FALSE]
+
+# Obtenemos la variable objetivo del conjunto de entrenamiento
+grade_train <- droplevels(grade[idx_train])
+
+# Obtenemos la variable objetivo de prueba interna
+grade_test <- droplevels(grade[-idx_train])
+
+# Comprobamos las dimensiones de entrenamiento
+dim(expr_train)
+
+# Comprobamos la distribución del grado histológico en entrenamiento
+table(grade_train)
+
+# Comprobamos las dimensiones de prueba interna
+dim(expr_test)
+
+# Comprobamos la distribución del grado histológico en prueba interna
+table(grade_test)
+```
+
+La partición estratificada genera un conjunto de train formado por **204
+muestras** y **22.283 probesets**, mientras que el conjunto de test
+queda formado por **85 muestras** y el mismo número de variables. La
+distribución de clases se mantiene proporcional en ambos subconjuntos,
+el train contiene **48 muestras G1**, **117 muestras G2** y **39
+muestras G3**, mientras que la test conserva **20 muestras G1**, **49
+muestras G2** y **16 muestras G3**. No obstante, en ambos subconjuntos
+se mantiene el predominio de la clase **G2**, por lo que el desbalance
+de clases sigue presente tras la partición. Por este motivo, en la fase
+de entrenamiento de los modelos se incorporará **SMOTE** dentro de la
+validación cruzada.
+
+# Almacenamiento y carga de los datos
+
+Con el objetivo de evitar repetir todo el proceso de descarga,
+preparación, corrección por ComBat y partición de los datos en cada
+ejecución, se almacenan los conjuntos ya procesados en archivos CSV. De
+esta forma, se guardan por separado las matrices de expresión y las
+variables objetivo correspondientes al conjunto de entrenamiento, al
+conjunto de prueba interna y al conjunto de validación externa. Este
+paso permite ahorrar tiempo en ejecuciones posteriores y continuar el
+análisis directamente desde los datos ya corregidos y divididos. Además,
+al conservar los archivos generados, se facilita la reproducibilidad del
+flujo de trabajo y se evita depender de nuevas descargas desde GEO cada
+vez que se ejecute el documento.
+
+```{r guardar_datos_csv}
+# Creamos una carpeta para guardar los archivos procesados
+dir.create("datos_procesados", showWarnings = FALSE)
+
+# Guardamos la matriz de entrenamiento
+write.csv(
+  expr_train,
+  "datos_procesados/expr_train.csv",
+  row.names = TRUE
+)
+
+# Guardamos la variable objetivo del conjunto de entrenamiento
+write.csv(
+  data.frame(grade_train = grade_train),
+  "datos_procesados/grade_train.csv",
+  row.names = TRUE
+)
+
+# Guardamos la matriz de prueba interna
+write.csv(
+  expr_test,
+  "datos_procesados/expr_test.csv",
+  row.names = TRUE
+)
+
+# Guardamos la variable objetivo del conjunto de prueba interna
+write.csv(
+  data.frame(grade_test = grade_test),
+  "datos_procesados/grade_test.csv",
+  row.names = TRUE
+)
+
+# Guardamos la matriz de validación externa
+write.csv(
+  expr_validacion_externa,
+  "datos_procesados/expr_validacion_externa.csv",
+  row.names = TRUE
+)
+
+# Guardamos la variable objetivo del conjunto de validación externa
+write.csv(
+  data.frame(grade_validacion_externa = grade_validacion_externa),
+  "datos_procesados/grade_validacion_externa.csv",
+  row.names = TRUE
+)
+```
+
+Posteriormente, estos archivos pueden cargarse de nuevo en el entorno de
+trabajo. Al hacerlo, se recuperan los nombres de las muestras como
+identificadores de fila y se mantienen los nombres originales de los
+probesets. Además, las variables objetivo se convierten de nuevo en
+factores con los niveles G1, G2 y G3.
+
+```{r}
+# Cargamos la matriz de entrenamiento
+expr_train <- read.csv(
+  "datos_procesados/expr_train.csv",
+  row.names = 1,
+  check.names = FALSE
+)
+
+# Cargamos la variable objetivo del conjunto de entrenamiento
+grade_train <- read.csv(
+  "datos_procesados/grade_train.csv",
+  row.names = 1
+)$grade_train
+
+grade_train <- factor(
+  grade_train, 
+  levels = c("G1", "G2", "G3")
+)
+
+# Cargamos la matriz de prueba interna
+expr_test <- read.csv(
+  "datos_procesados/expr_test.csv",
+  row.names = 1,
+  check.names = FALSE
+)
+
+# Cargamos la variable objetivo del conjunto de prueba interna
+grade_test <- read.csv(
+  "datos_procesados/grade_test.csv",
+  row.names = 1
+)$grade_test
+
+grade_test <- factor(
+  grade_test, 
+  levels = c("G1", "G2", "G3")
+)
+
+# Cargamos la matriz de validación externa
+expr_validacion_externa <- read.csv(
+  "datos_procesados/expr_validacion_externa.csv",
+  row.names = 1,
+  check.names = FALSE
+)
+
+# Cargamos la variable objetivo del conjunto de validación externa
+grade_validacion_externa <- read.csv(
+  "datos_procesados/grade_validacion_externa.csv",
+  row.names = 1
+)$grade_validacion_externa
+
+grade_validacion_externa <- factor(
+  grade_validacion_externa,
+  levels = c("G1", "G2", "G3")
+)
+```
+
+# Comprobaciones de calidad
+
+Una vez cargados los conjuntos de entrenamiento, prueba interna y
+validación externa, se realizan una serie de comprobaciones básicas para
+verificar que los datos conservan una estructura adecuada para el
+modelado. En concreto, se evalúa la presencia de valores ausentes,
+variables no numéricas, muestras duplicadas y probesets duplicados.
+Además, se comprueba que los tres conjuntos mantienen los mismos
+probesets y en el mismo orden.
+
+```{r comprobaciones_calidad}
+# Comprobamos valores ausentes en el conjunto de entrenamiento
+sum(is.na(expr_train))
+
+# Comprobamos valores ausentes en el conjunto de prueba interna
+sum(is.na(expr_test))
+
+# Comprobamos valores ausentes en el conjunto de validación externa
+sum(is.na(expr_validacion_externa))
+
+# Comprobamos variables no numéricas en el conjunto de entrenamiento
+sum(!sapply(expr_train, is.numeric))
+
+# Comprobamos variables no numéricas en el conjunto de prueba interna
+sum(!sapply(expr_test, is.numeric))
+
+# Comprobamos variables no numéricas en el conjunto de validación externa
+sum(!sapply(expr_validacion_externa, is.numeric))
+
+# Comprobamos muestras duplicadas en cada conjunto
+sum(duplicated(rownames(expr_train)))
+sum(duplicated(rownames(expr_test)))
+sum(duplicated(rownames(expr_validacion_externa)))
+
+# Comprobamos probesets duplicados en cada conjunto
+sum(duplicated(colnames(expr_train)))
+sum(duplicated(colnames(expr_test)))
+sum(duplicated(colnames(expr_validacion_externa)))
+
+# Comprobamos que los probesets coinciden entre entrenamiento y prueba interna
+identical(colnames(expr_train), colnames(expr_test))
+
+# Comprobamos que los probesets coinciden entre entrenamiento y validación externa
+identical(colnames(expr_train), colnames(expr_validacion_externa))
+```
+
+Las comprobaciones confirman que los conjuntos cargados presentan una
+estructura adecuada para continuar el análisis. No se detectan valores
+ausentes, variables no numéricas, muestras duplicadas ni probesets
+duplicados en ninguno de los tres conjuntos. Además, los resultados
+`TRUE` indican que los probesets coinciden y se encuentran en el mismo
+orden entre el conjunto de entrenamiento, el conjunto de prueba interna
+y el conjunto de validación externa.
+
+# **Distribución de las expresiones**
+
+```{r distribucion_expresiones}
+# Convertimos la expresión del conjunto principal a matriz numérica
+expr_mat <- as.matrix(expr)
+
+# Representamos la distribución de expresión en todas las muestras
+boxplot(
+  t(expr_mat),
+  xaxt = "n",
+  main = "Distribución de expresión en todas las muestras",
+  ylab = "Expresión",
+  outline = FALSE
+)
+```
+
+Las distribuciones de expresión son comparables entre muestras, sin
+observarse muestras claramente desplazadas respecto al conjunto general.
+Esto sugiere que los datos presentan una estructura adecuada para
+continuar con el análisis exploratorio y el posterior modelado
+supervisado.
+
+## Análisis exploratorio mediante PCA
+
+A continuación, se realiza un análisis de componentes principales sobre
+el conjunto principal con el objetivo de observar la distribución global
+de las muestras en función del grado histológico. Esta representación
+permite explorar si existen patrones generales en los perfiles de
+expresión génica que separen, al menos parcialmente, las muestras de
+grado G1, G2 y G3.
+
+```{r}
+# Obtenemos la varianza de cada probeset
+var_probesets <- apply(expr_mat, 2, var)
+
+# Seleccionamos los 1000 probesets más variables
+top_var <- names(sort(var_probesets, decreasing = TRUE))[1:1000]
+expr_pca <- expr_mat[, top_var, drop = FALSE]
+
+# Calculamos el PCA centrado y escalado
+pca <- prcomp(expr_pca, center = TRUE, scale. = TRUE)
+
+# Obtenemos el porcentaje de varianza explicada
+var_exp <- round((pca$sdev^2 / sum(pca$sdev^2)) * 100, 2)
+```
+
+```{r}
+# Representamos el PCA en función del grado histológico
+plot(
+  pca$x[, 1],
+  pca$x[, 2],
+  col = as.numeric(grade),
+  pch = 20,
+  xlab = paste0("PC1 (", var_exp[1], "%)"),
+  ylab = paste0("PC2 (", var_exp[2], "%)"),
+  main = "PCA de las muestras según grado histológico"
+)
+
+legend(
+  "topright",
+  legend = levels(grade),
+  col = 1:3,
+  pch = 19
+)
+```
+
+El PCA no muestra una separación completa entre los tres grados
+histológicos, lo que indica que la variabilidad global de la expresión
+no permite distinguir claramente las clases mediante las dos primeras
+componentes principales. No obstante, se observa cierto solapamiento
+entre grados, especialmente en el grado 2, que presenta un
+comportamiento más heterogéneo. Este patrón es coherente con el carácter
+intermedio del grado histológico 2, mientras que los grados histológicos
+1 y 3 sí que están más diferenciados.
+
+# Filtrado no supervisado por correlación
+
+Antes de aplicar los métodos de selección de características, se realiza
+un filtrado no supervisado para reducir la redundancia entre variables.
+En este paso se calcula la matriz de correlación entre probesets
+utilizando únicamente el conjunto de train. Posteriormente, se eliminan
+aquellos probesets que presentan una correlación elevada con otros, ya
+que aportan información muy similar y pueden aumentar innecesariamente
+la complejidad del modelo.
+
+El filtrado se calcula solo sobre el conjunto de train y después se
+aplica el mismo conjunto de probesets seleccionados al conjunto de test
+y al conjunto de validación externa. De esta forma, se evita utilizar
+información procedente de los conjuntos de evaluación durante el
+preprocesamiento.
+
+```{r filtrado_correlacion}
+corr_cutoff <- 0.90
+
+# Calculamos la matriz de correlación entre probesets en entrenamiento
+cor_matrix <- cor(expr_train)
+
+# Identificamos los probesets altamente correlacionados
+high_corr <- findCorrelation(
+  cor_matrix,
+  cutoff = corr_cutoff,
+  names = TRUE
+)
+
+# Comprobamos el número de probesets eliminados
+length(high_corr)
+
+# Filtramos el conjunto de entrenamiento
+expr_train_corr <- expr_train[, !colnames(expr_train) %in% high_corr, drop = FALSE]
+
+# Aplicamos el mismo filtrado al conjunto de prueba interna
+expr_test_corr <- expr_test[, colnames(expr_train_corr), drop = FALSE]
+
+# Aplicamos el mismo filtrado al conjunto de validación externa
+expr_validacion_externa_corr <- expr_validacion_externa[, colnames(expr_train_corr), drop = FALSE]
+
+# Comprobamos las dimensiones después del filtrado
+dim(expr_train_corr)
+dim(expr_test_corr)
+dim(expr_validacion_externa_corr)
+```
+
+El filtrado no supervisado por correlación elimina **489 probesets** que
+presentaban una correlación elevada con otros probesets del conjunto de
+entrenamiento. Tras aplicar este filtro, los tres conjuntos mantienen
+las mismas variables. Por una parte, el conjunto de train queda formado
+por **204 muestras** y **21.794 probesets**, el conjunto de test por
+**85 muestras** y **21.794 probesets**, y el conjunto de validación
+externa por **172 muestras** y **21.794 probesets**.
+
+# **Selección de *probesets***
+
+Los datos de microarrays se caracterizan por presentar una
+dimensionalidad muy elevada, es decir, presentan miles de variables
+frente a un número reducido de muestras. Esta situación puede dificultar
+el entrenamiento de modelos predictivos, aumentar el coste computacional
+y favorecer el sobreajuste. Por ello, la selección de variables
+constituye una etapa fundamental en este tipo de análisis, ya que
+permite reducir el número de *probesets* conservando aquellos con mayor
+interés para la clasificación.
+
+En este trabajo, la selección de *probesets* se realiza únicamente sobre
+el conjunto de train. De esta forma, el conjunto de test permanece
+independiente y no participa en ninguna decisión relacionada con la
+selección de variables. Para facilitar la comparación entre métodos, se
+seleccionan los 100 probesets mejor posicionados por cada técnica,
+utilizando el criterio de ordenación propio de cada una de ellas.
+
+Se comparan distintas familias de métodos de selección de variables
+descritas habitualmente en el análisis de datos de microarrays: métodos
+***filter***, métodos ***embedded***, métodos ***wrapper***, métodos
+**híbridos** y enfoques ***ensemble***. Esta clasificación permite
+evaluar estrategias con distintos criterios de selección, desde métodos
+basados en medidas estadísticas independientes del clasificador hasta
+aproximaciones que incorporan el modelo predictivo dentro del propio
+proceso de selección.
+
+## **Métodos *filter***
+
+Los métodos *filter* seleccionan variables a partir de propiedades de
+los datos, sin depender directamente de un clasificador concreto. En
+general, asignan una puntuación o medida de relevancia a cada variable y
+utilizan ese criterio para ordenar o seleccionar los *probesets* más
+informativos.
+
+### ANOVA
+
+Dado que el análisis ANOVA (análisis de la varianza) se aplica de forma
+univariante independiente a miles de probesets, se genera un problema de
+comparaciones múltiples. Para controlar este efecto, se ajustan los
+p-valores mediante el método de Benjamini-Hochberg, que permite
+controlar la tasa de falsos descubrimientos (*False Discovery Rate*,
+FDR). Esta corrección resulta especialmente adecuada en estudios de
+expresión génica, ya que métodos más conservadores, como Bonferroni,
+pueden reducir excesivamente el número de probesets seleccionados.
+
+En este caso, para cada probeset se plantea una hipótesis nula y una
+hipótesis alternativa. La hipótesis nula (H0) establece que la expresión
+media del probeset es igual en los tres grados histológicos, es decir,
+que no existen diferencias relevantes entre G1, G2 y G3. Por el
+contrario, la hipótesis alternativa (H1) indica que al menos uno de los
+grados presenta una expresión media diferente. De esta forma, ANOVA
+permite identificar aquellos probesets cuya expresión varía en función
+del grado histológico y que, por tanto, pueden resultar útiles para la
+clasificación posterior.
+
+```{r seleccion_anova}
+# Definimos el número de probesets que seleccionamos
+top_n_features <- 100
+
+# Calculamos el p-valor de ANOVA para cada probeset en el conjunto de entrenamiento
+anova_pvalues <- apply(expr_train_corr, 2, function(x) {
+  modelo_anova <- summary(aov(x ~ grade_train))[[1]]
+  modelo_anova[["Pr(>F)"]][1]
+})
+
+# Creamos una tabla con los resultados de ANOVA
+tabla_anova <- data.frame(
+  probeset = names(anova_pvalues),
+  p_value = anova_pvalues
+)
+
+# Ajustamos los p-valores por comparaciones múltiples mediante Benjamini-Hochberg
+tabla_anova$p_adj_BH <- p.adjust(
+  tabla_anova$p_value,
+  method = "BH"
+)
+
+# Ordenamos los probesets según el p-valor ajustado
+tabla_anova <- tabla_anova[order(tabla_anova$p_adj_BH), ]
+
+# Seleccionamos los probesets con menor p-valor ajustado
+ps_anova_100 <- head(tabla_anova$probeset, top_n_features)
+
+# Comprobamos el número de probesets seleccionados
+length(ps_anova_100)
+```
+
+### **mRMR**
+
+mRMR (*minimum Redundancy Maximum Relevance*) es un método *filter*
+multivariante orientado a identificar variables con máxima relevancia y
+mínima redundancia en datos de alta dimensionalidad. A diferencia de
+ANOVA, no solo busca probesets relacionados con el grado histológico,
+sino que también intenta reducir la redundancia entre las variables
+seleccionadas. De esta forma, prioriza subconjuntos de probesets que
+aporten información relevante para la clasificación, evitando
+seleccionar variables excesivamente similares entre sí.
+
+Al igual que en el caso anterior, la selección se realiza únicamente
+sobre el conjunto de entrenamiento. Finalmente, se conservan los 100
+probesets mejor posicionados por el método.
+
+```{r seleccion_mrmr}
+# Preparamos la variable objetivo en formato numérico para mRMR
+grade_train_num <- as.numeric(grade_train)
+
+# Creamos el data frame de entrada para mRMR
+datos_mrmr <- data.frame(
+  grado = grade_train_num,
+  expr_train_corr,
+  check.names = FALSE
+)
+
+# Convertimos los datos al formato requerido por mRMRe
+datos_mrmr <- mRMR.data(data = datos_mrmr)
+
+# Aplicamos mRMR sobre el conjunto de entrenamiento
+modelo_mrmr <- mRMR.classic(
+  data = datos_mrmr,
+  target_indices = 1,
+  feature_count = top_n_features
+)
+
+# Obtenemos los índices de los probesets seleccionados
+idx_mrmr <- solutions(modelo_mrmr)[[1]]
+
+# Obtenemos los nombres de los probesets seleccionados
+ps_mrmr_100 <- featureNames(datos_mrmr)[idx_mrmr]
+
+# Comprobamos el número de probesets seleccionados
+length(ps_mrmr_100)
+```
+
+En los dos métodos *filter* aplicados se obtiene un conjunto final de
+**100 probesets** seleccionados a partir del conjunto de train.
+
+## **Métodos *embedded***
+
+Los métodos *embedded* integran la selección de variables dentro del
+propio proceso de aprendizaje del modelo. A diferencia de los métodos
+*filter*, no se basan únicamente en una medida estadística externa, sino
+que identifican los *probesets* relevantes mientras se ajusta el modelo.
+Utilizan el núcleo del algoritmo de aprendizaje para valorar la
+importancia de las variables, un ejemplo de estos métodos son LASSO y
+SVM-RFE.
+
+### LASSO
+
+El método LASSO (*Least Absolute Shrinkage and Selection Operator*)
+ajusta un modelo multinomial penalizado mediante regularización L1, lo
+que favorece que algunos coeficientes se reduzcan exactamente a cero. De
+este modo, los *probesets* con coeficientes distintos de cero se
+consideran variables seleccionadas por el modelo. En este caso, al
+tratarse de un problema multiclase, cada *probeset* puede tener
+coeficientes asociados a las distintas clases. Por ello, en este
+análisis se resume la importancia de cada *probeset* mediante el valor
+absoluto máximo de sus coeficientes entre clases, generando un ranking
+final del que se seleccionan los primeros 100 *probesets,* si llegan.
+
+```{r seleccion_lasso}
+# Preparamos la matriz de expresión para LASSO
+x_lasso <- as.matrix(expr_train_corr)
+
+# Preparamos la variable objetivo para LASSO
+y_lasso <- grade_train
+
+# Ajustamos un modelo LASSO multinomial con validación cruzada
+set.seed(seed)
+modelo_lasso <- cv.glmnet(
+  x = x_lasso,
+  y = y_lasso,
+  family = "multinomial",
+  alpha = 1,
+  type.measure = "class",
+  nfolds = 5
+)
+
+# Obtenemos los coeficientes del modelo con lambda mínimo
+coef_lasso <- coef(modelo_lasso, s = "lambda.min")
+
+# Unimos los coeficientes de las tres clases en una matriz
+coef_lasso_mat <- do.call(
+  cbind,
+  lapply(coef_lasso, function(x) as.numeric(x[, 1]))
+)
+
+# Asignamos los nombres de los probesets a la matriz de coeficientes
+rownames(coef_lasso_mat) <- rownames(coef_lasso[[1]])
+
+# Eliminamos los iguales
+coef_lasso_mat <- coef_lasso_mat[rownames(coef_lasso_mat) != "(Intercept)", , drop = FALSE]
+
+# Calculamos la importancia de cada probeset como el coeficiente absoluto máximo
+importancia_lasso <- apply(abs(coef_lasso_mat), 1, max)
+
+# Creamos una tabla con los resultados de LASSO
+tabla_lasso <- data.frame(
+  probeset = names(importancia_lasso),
+  importancia = importancia_lasso
+)
+
+# Conservamos únicamente los probesets con coeficiente distinto de cero
+tabla_lasso <- tabla_lasso[tabla_lasso$importancia > 0, ]
+
+# Ordenamos los probesets según su importancia
+tabla_lasso <- tabla_lasso[order(tabla_lasso$importancia, decreasing = TRUE), ]
+
+# Seleccionamos los 100 probesets más relevantes según LASSO
+ps_lasso_100 <- head(tabla_lasso$probeset, top_n_features)
+
+# Comprobamos el número de probesets seleccionados
+length(ps_lasso_100)
+```
+
+### SVM-RFE
+
+SVM-RFE (*Support Vector Machine Recursive Feature Elimination*) se
+aplica como método *embedded* basado en SVM. Este procedimiento elimina
+variables de forma recursiva, conservando aquellas que resultan más
+relevantes para el modelo durante el proceso de clasificación. A
+diferencia de los métodos *filter*, SVM-RFE incorpora el modelo
+predictivo dentro del propio proceso de selección, por lo que la
+importancia de cada probeset se evalúa en función de su contribución al
+clasificador.
+
+En este trabajo se evalúan dos variantes del método: una con kernel
+lineal y otra con kernel radial. El objetivo es comparar si la selección
+de probesets cambia en función del tipo de frontera de decisión
+utilizada por el modelo.
+
+A diferencia de métodos como ANOVA o mRMR, que generan un ranking de
+variables sobre el que se aplica un corte fijo, en SVM-RFE no se fija
+directamente un número final de probesets. En este caso, se evalúan
+distintos tamaños de firma génica mediante validación cruzada interna
+dentro del conjunto de train. De esta forma, el número final de
+probesets seleccionados viene determinado por el tamaño que obtiene el
+mejor rendimiento durante este proceso.
+
+Dado el elevado número de probesets, antes de aplicar SVM-RFE se realiza
+un prefiltrado no supervisado por varianza dentro del conjunto de train.
+Este paso permite reducir el coste computacional del procedimiento,
+conservando los probesets con mayor variabilidad sin utilizar
+información del conjunto de test ni de la validación externa.
+
+```{r preparacion_svmrfe}
+# Definimos el número de probesets que mantenemos en el prefiltrado de SVM-RFE
+top_n_rfe_prefiltro <- 2000
+
+# Definimos el número máximo de probesets que permitimos seleccionar
+max_features_rfe <- 100
+
+# Calculamos la varianza de cada probeset en el conjunto de entrenamiento
+var_rfe <- apply(expr_train_corr, 2, var)
+
+# Seleccionamos los probesets con mayor varianza
+ps_rfe_prefiltro <- names(
+  sort(var_rfe, decreasing = TRUE)
+)[1:top_n_rfe_prefiltro]
+
+# Filtramos el conjunto de entrenamiento para aplicar SVM-RFE
+expr_train_rfe_pref <- expr_train_corr[, ps_rfe_prefiltro, drop = FALSE]
+
+# Definimos los tamaños de firma génica que evaluamos con SVM-RFE
+sizes_rfe <- c(5, 10, 20, 30, 50, 100)
+
+# Nos aseguramos de que ningún tamaño supera el máximo permitido
+sizes_rfe <- sizes_rfe[sizes_rfe <= max_features_rfe]
+
+# Definimos el control de validación cruzada interna para SVM-RFE
+ctrl_rfe <- rfeControl(
+  functions = caretFuncs,
+  method = "cv",
+  number = 5,
+  verbose = FALSE
+)
+```
+
+```{r svm_rfe_lineal}
+# Aplicamos SVM-RFE con kernel lineal sobre el conjunto de entrenamiento
+set.seed(seed)
+
+modelo_svmrfe_lineal <- rfe(
+  x = expr_train_rfe_pref,
+  y = grade_train,
+  sizes = sizes_rfe,
+  rfeControl = ctrl_rfe,
+  method = "svmLinear",
+  metric = "Accuracy",
+  preProcess = c("center", "scale"),
+  tuneLength = 3
+)
+
+# Seleccionamos únicamente los resultados con un máximo de 100 probesets
+resultados_lineal_validos <- modelo_svmrfe_lineal$results[
+  modelo_svmrfe_lineal$results$Variables <= max_features_rfe,
+]
+
+# Obtenemos el tamaño con mejor Accuracy dentro de los tamaños permitidos
+mejor_size_svmrfe_lineal <- resultados_lineal_validos$Variables[
+  which.max(resultados_lineal_validos$Accuracy)
+]
+
+# Extraemos el ranking de variables correspondiente al tamaño seleccionado
+ranking_lineal <- modelo_svmrfe_lineal$variables[
+  modelo_svmrfe_lineal$variables$Variables == mejor_size_svmrfe_lineal,
+]
+
+# Calculamos la importancia media de cada probeset entre particiones
+ranking_lineal_resumen <- aggregate(
+  Overall ~ var,
+  data = ranking_lineal,
+  FUN = mean
+)
+
+# Ordenamos los probesets según su importancia
+ranking_lineal_resumen <- ranking_lineal_resumen[
+  order(ranking_lineal_resumen$Overall, decreasing = TRUE),
+]
+
+# Obtenemos los probesets seleccionados por SVM-RFE lineal
+ps_svmrfe_lineal <- head(
+  ranking_lineal_resumen$var,
+  mejor_size_svmrfe_lineal
+)
+
+# Comprobamos el número de probesets seleccionados
+length(ps_svmrfe_lineal)
+```
+
+```{r seleccion_svmrfe_radial}
+# Aplicamos SVM-RFE con kernel radial sobre el conjunto de entrenamiento
+set.seed(seed)
+
+modelo_svmrfe_radial <- rfe(
+  x = expr_train_rfe_pref,
+  y = grade_train,
+  sizes = sizes_rfe,
+  rfeControl = ctrl_rfe,
+  method = "svmRadial",
+  metric = "Accuracy",
+  preProcess = c("center", "scale"),
+  tuneLength = 3
+)
+
+# Seleccionamos únicamente los resultados con un máximo de 100 probesets
+resultados_radial_validos <- modelo_svmrfe_radial$results[
+  modelo_svmrfe_radial$results$Variables <= max_features_rfe,
+]
+
+# Obtenemos el tamaño con mejor Accuracy dentro de los tamaños permitidos
+mejor_size_svmrfe_radial <- resultados_radial_validos$Variables[
+  which.max(resultados_radial_validos$Accuracy)
+]
+
+# Extraemos el ranking de variables correspondiente al tamaño seleccionado
+ranking_radial <- modelo_svmrfe_radial$variables[
+  modelo_svmrfe_radial$variables$Variables == mejor_size_svmrfe_radial,
+]
+
+# Calculamos la importancia media de cada probeset entre particiones
+ranking_radial_resumen <- aggregate(
+  Overall ~ var,
+  data = ranking_radial,
+  FUN = mean
+)
+
+# Ordenamos los probesets según su importancia
+ranking_radial_resumen <- ranking_radial_resumen[
+  order(ranking_radial_resumen$Overall, decreasing = TRUE),
+]
+
+# Obtenemos los probesets seleccionados por SVM-RFE radial
+ps_svmrfe_radial <- head(
+  ranking_radial_resumen$var,
+  mejor_size_svmrfe_radial
+)
+
+# Comprobamos el número de probesets seleccionados
+length(ps_svmrfe_radial)
+```
+
+En los métodos *embedded* aplicados, el número final de probesets
+seleccionados depende del propio proceso de ajuste de cada modelo. En el
+caso de LASSO, se obtiene un conjunto final de **70 probesets**. Por
+otro lado, SVM-RFE con kernel lineal y SVM-RFE con kernel radial
+seleccionan **100 probesets** cada uno.
+
+## **Métodos híbridos**
+
+Los métodos híbridos combinan dos estrategias de selección de variables
+en etapas sucesivas. En primer lugar, se aplica un método de reducción
+inicial para obtener un subconjunto de *probesets* candidatos.
+Posteriormente, sobre ese subconjunto reducido se aplica un segundo
+método de selección más específico.
+
+En este trabajo se combinan los métodos *filter* previamente utilizados,
+ANOVA y mRMR, con métodos *embedded*, LASSO multinomial y SVM-RFE. De
+esta forma, los métodos *filter* actúan como una primera etapa de
+reducción de dimensionalidad, mientras que LASSO y SVM-RFE refinan la
+selección final de *probesets*.
+
+```{r preparacion_hibridos}
+# Partimos (primera etapa) de los seleccionados previamente por ANOVA y mRMR
+expr_train_anova_100 <- expr_train_corr[, ps_anova_100, drop = FALSE]
+expr_train_mrmr_100  <- expr_train_corr[, ps_mrmr_100, drop = FALSE]
+```
+
+### ANOVA + LASSO
+
+```{r hibrido_anova_lasso}
+# Preparamos la matriz de entrenamiento para ANOVA + LASSO
+x_anova_lasso <- as.matrix(expr_train_anova_100)
+
+# Preparamos la variable objetivo
+y_anova_lasso <- grade_train
+
+# Ajustamos un modelo LASSO sobre los probesets seleccionados por ANOVA
+set.seed(seed)
+modelo_anova_lasso <- cv.glmnet(
+  x = x_anova_lasso,
+  y = y_anova_lasso,
+  family = "multinomial",
+  alpha = 1,
+  type.measure = "class",
+  nfolds = 5
+)
+
+# Obtenemos los coeficientes del modelo con lambda mínimo
+coef_anova_lasso <- coef(
+  modelo_anova_lasso,
+  s = "lambda.min"
+)
+
+# Unimos los coeficientes de las tres clases en una matriz
+coef_anova_lasso_mat <- do.call(
+  cbind,
+  lapply(coef_anova_lasso, function(x) as.numeric(x[, 1]))
+)
+
+# Asignamos los nombres de los probesets a la matriz de coeficientes
+rownames(coef_anova_lasso_mat) <- rownames(coef_anova_lasso[[1]])
+
+# Eliminamos el intercepto, ya que no corresponde a ningún probeset
+coef_anova_lasso_mat <- coef_anova_lasso_mat[
+  rownames(coef_anova_lasso_mat) != "(Intercept)", , drop = FALSE]
+
+# Calculamos la importancia de cada probeset como el coeficiente absoluto máximo
+importancia_anova_lasso <- apply(
+  abs(coef_anova_lasso_mat), 1, max)
+
+# Creamos una tabla con los resultados de ANOVA + LASSO
+tabla_anova_lasso <- data.frame(
+  probeset = names(importancia_anova_lasso),
+  importancia = importancia_anova_lasso
+)
+
+# Conservamos únicamente los probesets con coeficiente distinto de cero
+tabla_anova_lasso <- tabla_anova_lasso[
+  tabla_anova_lasso$importancia > 0,
+]
+
+# Ordenamos los probesets según su importancia
+tabla_anova_lasso <- tabla_anova_lasso[
+  order(tabla_anova_lasso$importancia, decreasing = TRUE),
+]
+
+# Seleccionamos los probesets finales de ANOVA + LASSO
+ps_anova_lasso <- head(
+  tabla_anova_lasso$probeset,
+  top_n_features
+)
+
+# Comprobamos el número de probesets seleccionados
+length(ps_anova_lasso)
+```
+
+### ANOVA + SVM-RFE lineal
+
+```{r hibrido_anova_svmrfe_lineal}
+# Definimos los tamaños de firma génica que evaluamos en ANOVA + SVM-RFE lineal
+sizes_anova_svmrfe <- sizes_rfe[
+  sizes_rfe <= ncol(expr_train_anova_100)
+]
+
+# Aplicamos SVM-RFE lineal sobre los probesets seleccionados por ANOVA
+set.seed(seed)
+
+modelo_anova_svmrfe_lineal <- rfe(
+  x = expr_train_anova_100,
+  y = grade_train,
+  sizes = sizes_anova_svmrfe,
+  rfeControl = ctrl_rfe,
+  method = "svmLinear",
+  metric = "Accuracy",
+  preProcess = c("center", "scale"),
+  tuneLength = 3
+)
+
+# Seleccionamos únicamente los resultados con un máximo de 100 probesets
+resultados_anova_svmrfe_lineal_validos <- modelo_anova_svmrfe_lineal$results[
+  modelo_anova_svmrfe_lineal$results$Variables <= max_features_rfe,
+]
+
+# Obtenemos el tamaño con mejor Accuracy dentro de los tamaños permitidos
+mejor_size_anova_svmrfe_lineal <- resultados_anova_svmrfe_lineal_validos$Variables[
+  which.max(resultados_anova_svmrfe_lineal_validos$Accuracy)
+]
+
+# Extraemos el ranking de variables correspondiente al tamaño seleccionado
+ranking_anova_svmrfe_lineal <- modelo_anova_svmrfe_lineal$variables[
+  modelo_anova_svmrfe_lineal$variables$Variables == mejor_size_anova_svmrfe_lineal,
+]
+
+# Calculamos la importancia media de cada probeset entre particiones
+ranking_anova_svmrfe_lineal_resumen <- aggregate(
+  Overall ~ var,
+  data = ranking_anova_svmrfe_lineal,
+  FUN = mean
+)
+
+# Ordenamos los probesets según su importancia
+ranking_anova_svmrfe_lineal_resumen <- ranking_anova_svmrfe_lineal_resumen[
+  order(ranking_anova_svmrfe_lineal_resumen$Overall, decreasing = TRUE),
+]
+
+# Obtenemos los probesets seleccionados por ANOVA + SVM-RFE lineal
+ps_anova_svmrfe_lineal <- head(
+  ranking_anova_svmrfe_lineal_resumen$var,
+  mejor_size_anova_svmrfe_lineal
+)
+
+# Comprobamos el número de probesets seleccionados
+length(ps_anova_svmrfe_lineal)
+```
+
+### ANOVA + SVM-RFE radial
+
+```{r hibrido_anova_svmrfe_radial}
+# Definimos los tamaños de firma génica que evaluamos en ANOVA + SVM-RFE radial
+sizes_anova_svmrfe <- sizes_rfe[
+  sizes_rfe <= ncol(expr_train_anova_100)
+]
+
+# Aplicamos SVM-RFE radial sobre los probesets seleccionados por ANOVA
+set.seed(seed)
+
+modelo_anova_svmrfe_radial <- rfe(
+  x = expr_train_anova_100,
+  y = grade_train,
+  sizes = sizes_anova_svmrfe,
+  rfeControl = ctrl_rfe,
+  method = "svmRadial",
+  metric = "Accuracy",
+  preProcess = c("center", "scale"),
+  tuneLength = 3
+)
+
+# Seleccionamos únicamente los resultados con un máximo de 100 probesets
+resultados_anova_svmrfe_radial_validos <- modelo_anova_svmrfe_radial$results[
+  modelo_anova_svmrfe_radial$results$Variables <= max_features_rfe,
+]
+
+# Obtenemos el tamaño con mejor Accuracy dentro de los tamaños permitidos
+mejor_size_anova_svmrfe_radial <- resultados_anova_svmrfe_radial_validos$Variables[
+  which.max(resultados_anova_svmrfe_radial_validos$Accuracy)
+]
+
+# Extraemos el ranking de variables correspondiente al tamaño seleccionado
+ranking_anova_svmrfe_radial <- modelo_anova_svmrfe_radial$variables[
+  modelo_anova_svmrfe_radial$variables$Variables == mejor_size_anova_svmrfe_radial,
+]
+
+# Calculamos la importancia media de cada probeset entre particiones
+ranking_anova_svmrfe_radial_resumen <- aggregate(
+  Overall ~ var,
+  data = ranking_anova_svmrfe_radial,
+  FUN = mean
+)
+
+# Ordenamos los probesets según su importancia
+ranking_anova_svmrfe_radial_resumen <- ranking_anova_svmrfe_radial_resumen[
+  order(ranking_anova_svmrfe_radial_resumen$Overall, decreasing = TRUE),
+]
+
+# Obtenemos los probesets seleccionados por ANOVA + SVM-RFE radial
+ps_anova_svmrfe_radial <- head(
+  ranking_anova_svmrfe_radial_resumen$var,
+  mejor_size_anova_svmrfe_radial
+)
+
+# Comprobamos el número de probesets seleccionados
+length(ps_anova_svmrfe_radial)
+```
+
+En las combinaciones híbridas que parten de ANOVA se obtienen firmas
+génicas de distinto tamaño. La combinación **ANOVA + LASSO** reduce el
+conjunto inicial de 100 probesets a **34 probesets**. Por otro lado, las
+combinaciones **ANOVA + SVM-RFE lineal** y **ANOVA + SVM-RFE radial**
+seleccionan **100 probesets** cada una.
+
+### mRMR + LASSO
+
+```{r hibrido_mrmr_lasso}
+# Preparamos la matriz de entrenamiento para mRMR + LASSO
+x_mrmr_lasso <- as.matrix(expr_train_mrmr_100)
+
+# Preparamos la variable objetivo
+y_mrmr_lasso <- grade_train
+
+# Ajustamos un modelo LASSO multinomial sobre los probesets seleccionados por mRMR
+set.seed(seed)
+modelo_mrmr_lasso <- cv.glmnet(
+  x = x_mrmr_lasso,
+  y = y_mrmr_lasso,
+  family = "multinomial",
+  alpha = 1,
+  type.measure = "class",
+  nfolds = 5
+)
+
+# Obtenemos los coeficientes del modelo con lambda mínimo
+coef_mrmr_lasso <- coef(
+  modelo_mrmr_lasso,
+  s = "lambda.min"
+)
+
+# Unimos los coeficientes de las tres clases en una matriz
+coef_mrmr_lasso_mat <- do.call(
+  cbind,
+  lapply(coef_mrmr_lasso, function(x) as.numeric(x[, 1]))
+)
+
+# Asignamos los nombres de los probesets a la matriz de coeficientes
+rownames(coef_mrmr_lasso_mat) <- rownames(coef_mrmr_lasso[[1]])
+
+# Eliminamos el intercepto, ya que no corresponde a ningún probeset
+coef_mrmr_lasso_mat <- coef_mrmr_lasso_mat[
+  rownames(coef_mrmr_lasso_mat) != "(Intercept)", , drop = FALSE
+]
+
+# Calculamos la importancia de cada probeset como el coeficiente absoluto máximo
+importancia_mrmr_lasso <- apply(
+  abs(coef_mrmr_lasso_mat), 1, max
+)
+
+# Creamos una tabla con los resultados de mRMR + LASSO
+tabla_mrmr_lasso <- data.frame(
+  probeset = names(importancia_mrmr_lasso),
+  importancia = importancia_mrmr_lasso
+)
+
+# Conservamos únicamente los probesets con coeficiente distinto de cero
+tabla_mrmr_lasso <- tabla_mrmr_lasso[
+  tabla_mrmr_lasso$importancia > 0,
+]
+
+# Ordenamos los probesets según su importancia
+tabla_mrmr_lasso <- tabla_mrmr_lasso[
+  order(tabla_mrmr_lasso$importancia, decreasing = TRUE),
+]
+
+# Obtenemos los probesets seleccionados por mRMR + LASSO
+ps_mrmr_lasso <- head(
+  tabla_mrmr_lasso$probeset,
+  top_n_features
+)
+
+# Comprobamos el número de probesets seleccionados
+length(ps_mrmr_lasso)
+```
+
+### mRMR + SVM-RFE lineal
+
+```{r hibrido_mrmr_svmrfe_lineal}
+# Definimos los tamaños de firma génica que evaluamos en mRMR + SVM-RFE lineal
+sizes_mrmr_svmrfe <- sizes_rfe[
+  sizes_rfe <= ncol(expr_train_mrmr_100)
+]
+
+# Aplicamos SVM-RFE lineal sobre los probesets seleccionados por mRMR
+set.seed(seed)
+modelo_mrmr_svmrfe_lineal <- rfe(
+  x = expr_train_mrmr_100,
+  y = grade_train,
+  sizes = sizes_mrmr_svmrfe,
+  rfeControl = ctrl_rfe,
+  method = "svmLinear",
+  metric = "Accuracy",
+  preProcess = c("center", "scale"),
+  tuneLength = 3
+)
+
+# Seleccionamos únicamente los resultados con un máximo de 100 probesets
+resultados_mrmr_svmrfe_lineal_validos <- modelo_mrmr_svmrfe_lineal$results[
+  modelo_mrmr_svmrfe_lineal$results$Variables <= max_features_rfe,
+]
+
+# Obtenemos el tamaño con mejor Accuracy dentro de los tamaños permitidos
+mejor_size_mrmr_svmrfe_lineal <- resultados_mrmr_svmrfe_lineal_validos$Variables[
+  which.max(resultados_mrmr_svmrfe_lineal_validos$Accuracy)
+]
+
+# Extraemos el ranking de variables correspondiente al tamaño seleccionado
+ranking_mrmr_svmrfe_lineal <- modelo_mrmr_svmrfe_lineal$variables[
+  modelo_mrmr_svmrfe_lineal$variables$Variables == mejor_size_mrmr_svmrfe_lineal,
+]
+
+# Calculamos la importancia media de cada probeset entre particiones
+ranking_mrmr_svmrfe_lineal_resumen <- aggregate(
+  Overall ~ var,
+  data = ranking_mrmr_svmrfe_lineal,
+  FUN = mean
+)
+
+# Ordenamos los probesets según su importancia
+ranking_mrmr_svmrfe_lineal_resumen <- ranking_mrmr_svmrfe_lineal_resumen[
+  order(ranking_mrmr_svmrfe_lineal_resumen$Overall, decreasing = TRUE),
+]
+
+# Obtenemos los probesets seleccionados por mRMR + SVM-RFE lineal
+ps_mrmr_svmrfe_lineal <- head(
+  ranking_mrmr_svmrfe_lineal_resumen$var,
+  mejor_size_mrmr_svmrfe_lineal
+)
+
+# Comprobamos el número de probesets seleccionados
+length(ps_mrmr_svmrfe_lineal)
+```
+
+### mRMR + SVM-RFE radial
+
+```{r hibrido_mrmr_svmrfe_radial}
+# Definimos los tamaños de firma génica que evaluamos en mRMR + SVM-RFE radial
+sizes_mrmr_svmrfe <- sizes_rfe[
+  sizes_rfe <= ncol(expr_train_mrmr_100)
+]
+
+# Aplicamos SVM-RFE radial sobre los probesets seleccionados por mRMR
+set.seed(seed)
+modelo_mrmr_svmrfe_radial <- rfe(
+  x = expr_train_mrmr_100,
+  y = grade_train,
+  sizes = sizes_mrmr_svmrfe,
+  rfeControl = ctrl_rfe,
+  method = "svmRadial",
+  metric = "Accuracy",
+  preProcess = c("center", "scale"),
+  tuneLength = 3
+)
+
+# Seleccionamos únicamente los resultados con un máximo de 100 probesets
+resultados_mrmr_svmrfe_radial_validos <- modelo_mrmr_svmrfe_radial$results[
+  modelo_mrmr_svmrfe_radial$results$Variables <= max_features_rfe,
+]
+
+# Obtenemos el tamaño con mejor Accuracy dentro de los tamaños permitidos
+mejor_size_mrmr_svmrfe_radial <- resultados_mrmr_svmrfe_radial_validos$Variables[
+  which.max(resultados_mrmr_svmrfe_radial_validos$Accuracy)
+]
+
+# Extraemos el ranking de variables correspondiente al tamaño seleccionado
+ranking_mrmr_svmrfe_radial <- modelo_mrmr_svmrfe_radial$variables[
+  modelo_mrmr_svmrfe_radial$variables$Variables == mejor_size_mrmr_svmrfe_radial,
+]
+
+# Calculamos la importancia media de cada probeset entre particiones
+ranking_mrmr_svmrfe_radial_resumen <- aggregate(
+  Overall ~ var,
+  data = ranking_mrmr_svmrfe_radial,
+  FUN = mean
+)
+
+# Ordenamos los probesets según su importancia
+ranking_mrmr_svmrfe_radial_resumen <- ranking_mrmr_svmrfe_radial_resumen[
+  order(ranking_mrmr_svmrfe_radial_resumen$Overall, decreasing = TRUE),
+]
+
+# Obtenemos los probesets seleccionados por mRMR + SVM-RFE radial
+ps_mrmr_svmrfe_radial <- head(
+  ranking_mrmr_svmrfe_radial_resumen$var,
+  mejor_size_mrmr_svmrfe_radial
+)
+
+# Comprobamos el número de probesets seleccionados
+length(ps_mrmr_svmrfe_radial)
+```
+
+En las combinaciones híbridas que parten de mRMR se obtienen firmas
+génicas de distinto tamaño. La combinación **mRMR + LASSO** selecciona
+**59 probesets**, **mRMR + SVM-RFE lineal** selecciona **10 probesets**
+y **mRMR + SVM-RFE radial** selecciona **100 probesets**.
+
+## Métodos *ensemble*
+
+Finalmente, se construye una selección *ensemble* a partir de los
+probesets obtenidos por los métodos anteriores. Esta estrategia busca
+identificar probesets seleccionados de forma recurrente por distintas
+técnicas, asumiendo que aquellos que aparecen en varios métodos pueden
+representar variables más robustas para la clasificación. Para ello, se
+agrupan todos los subconjuntos de probesets generados, se calcula
+cuántas veces aparece cada probeset y se seleccionan los probesets que
+se repiten más de 3 o 4 veces, en este caso.
+
+Además, no se incluyen en el *ensemble* las combinaciones híbridas que
+vuelven a seleccionar los 100 probesets de partida, ya que en estos
+casos no se produce una reducción adicional de la firma inicial. De esta
+forma, se evita sobrerrepresentar métodos que no aportan una selección
+diferencial respecto a su primera etapa.
+
+```{r seleccion_ensemble}
+# Juntamos en una lista los conjuntos de probesets que mantenemos para el ensemble
+lista_metodos_ensemble <- list(
+  ANOVA = ps_anova_100,
+  mRMR = ps_mrmr_100,
+  LASSO = ps_lasso_100,
+  SVM_RFE_lineal = ps_svmrfe_lineal,
+  SVM_RFE_radial = ps_svmrfe_radial,
+  ANOVA_LASSO = ps_anova_lasso,
+  mRMR_LASSO = ps_mrmr_lasso,
+  mRMR_SVM_RFE_lineal = ps_mrmr_svmrfe_lineal
+)
+
+# Nos aseguramos de que cada método aporte cada probeset una sola vez
+lista_metodos_ensemble <- lapply(lista_metodos_ensemble, unique)
+
+# Unimos todos los probesets seleccionados en un único vector
+todos_los_probesets <- unlist(lista_metodos_ensemble)
+
+# Calculamos cuántas veces aparece cada probeset entre los distintos métodos
+frecuencia_probesets <- sort(
+  table(todos_los_probesets),
+  decreasing = TRUE
+)
+
+# Seleccionamos los probesets que aparecen en al menos cuatro métodos
+ps_ensemble_4votos <- names(
+  frecuencia_probesets[frecuencia_probesets >= 4]
+)
+
+# Seleccionamos los probesets que aparecen en al menos tres métodos
+ps_ensemble_3votos <- names(
+  frecuencia_probesets[frecuencia_probesets >= 3]
+)
+
+# Comprobamos el número de probesets seleccionados por cada ensemble
+length(ps_ensemble_4votos)
+length(ps_ensemble_3votos)
+
+# Creamos una tabla resumen de frecuencias
+tabla_ensemble <- data.frame(
+  probeset = names(frecuencia_probesets),
+  frecuencia = as.numeric(frecuencia_probesets)
+)
+```
+
+Como resultado del enfoque *ensemble*, se obtienen dos firmas
+candidatas. La primera, formada por los probesets presentes en al menos
+**cuatro métodos**, incluye **21 probesets**. La segunda, menos
+restrictiva, considera los probesets presentes en al menos **tres
+métodos** y está formada por **71 probesets**.
+
+# **Clasificación supervisada**
+
+En esta fase se comparan varios clasificadores sobre cada conjunto de
+probesets seleccionado. SMOTE se aplica dentro de la validación cruzada
+mediante `trainControl(sampling = "smote")`. De esta forma, las muestras
+sintéticas se generan únicamente dentro de los subconjuntos de
+entrenamiento de cada partición, sin modificar el conjunto de validación
+ni el conjunto de test.
+
+```{r}
+# Creamos la lista final de conjuntos de probesets para la clasificación
+lista_probesets <- list(
+  ANOVA = ps_anova_100,
+  mRMR = ps_mrmr_100,
+  LASSO = ps_lasso_100,
+  SVM_RFE_lineal = ps_svmrfe_lineal,
+  SVM_RFE_radial = ps_svmrfe_radial,
+  ANOVA_LASSO = ps_anova_lasso,
+  mRMR_LASSO = ps_mrmr_lasso,
+  mRMR_SVM_RFE_lineal = ps_mrmr_svmrfe_lineal,
+  Ensemble_4_votos = ps_ensemble_4votos,
+  Ensemble_3_votos = ps_ensemble_3votos
+)
+
+# Definimos el grupo al que pertenece cada método
+grupo_metodo <- c(
+  ANOVA = "Filter",
+  mRMR = "Filter",
+  LASSO = "Embedded",
+  SVM_RFE_lineal = "Embedded",
+  SVM_RFE_radial = "Embedded",
+  ANOVA_LASSO = "Hybrid",
+  mRMR_LASSO = "Hybrid",
+  mRMR_SVM_RFE_lineal = "Hybrid",
+  Ensemble_4_votos = "Ensemble",
+  Ensemble_3_votos = "Ensemble"
+)
+
+# Creamos una tabla resumen de las firmas de probesets
+resumen_seleccion <- data.frame(
+  metodo = names(lista_probesets),
+  grupo = grupo_metodo[names(lista_probesets)],
+  n_probesets = sapply(lista_probesets, length),
+  row.names = NULL
+)
+
+# Mostramos el resumen de selección
+resumen_seleccion
+```
+
+## Funciones auxiliares de clasificación
+
+Antes de entrenar los modelos, se definen varias funciones auxiliares
+para automatizar el proceso de evaluación. Estas funciones permiten
+calcular métricas adicionales, como la Macro-F1, entrenar los distintos
+clasificadores bajo una misma estrategia de validación cruzada con SMOTE
+y evaluar posteriormente su rendimiento sobre el conjunto de test
+interno.
+
+```{r}
+# Función para calcular la Macro-F1 a partir de una matriz de confusión
+macro_f1 <- function(cm) {
+  
+  # Convertimos la tabla de la matriz de confusión a formato matriz
+  tab <- as.matrix(cm$table)
+  
+  # Obtenemos los nombres de las clases
+  clases <- rownames(tab)
+  
+  # Calculamos el F1-score de cada clase por separado
+  f1_por_clase <- sapply(seq_along(clases), function(i) {
+    
+    # Calculamos verdaderos positivos, falsos positivos y falsos negativos
+    TP <- tab[i, i]
+    FP <- sum(tab[i, ]) - TP
+    FN <- sum(tab[, i]) - TP
+    
+    # Calculamos la precisión de la clase
+    precision <- ifelse((TP + FP) == 0, 0, TP / (TP + FP))
+    
+    # Calculamos el recall o sensibilidad de la clase
+    recall <- ifelse((TP + FN) == 0, 0, TP / (TP + FN))
+    
+    # Calculamos el F1-score de la clase
+    if ((precision + recall) == 0) {
+      return(0)
+    } else {
+      return(2 * precision * recall / (precision + recall))
+    }
+  })
+  
+  # Calculamos la media del F1-score de todas las clases
+  mean(f1_por_clase)
+}
+```
+
+```{r}
+# Función para entrenar distintos modelos de clasificación
+entrenar_modelo <- function(x_train, y_train, metodo, seed = 123) {
+  
+  # Definimos la validación cruzada repetida
+  # Incluimos SMOTE dentro de la validación cruzada para balancear los folds de train
+  ctrl <- trainControl(
+    method = "repeatedcv",
+    number = 5,
+    repeats = 3,
+    sampling = "smote",
+    savePredictions = "final"
+  )
+  
+  # Aseguramos que la variable respuesta tiene siempre los mismos niveles
+  y_train <- factor(y_train, levels = c("G1", "G2", "G3"))
+  
+  # Convertimos los predictores a data frame
+  x_train <- as.data.frame(x_train, check.names = FALSE)
+  
+  # Fijamos la semilla para hacer el entrenamiento reproducible
+  set.seed(seed)
+  
+  # Entrenamos un SVM con kernel lineal
+  if (metodo == "SVM_lineal") {
+    modelo <- train(
+      x = x_train,
+      y = y_train,
+      method = "svmLinear",
+      trControl = ctrl,
+      preProcess = c("center", "scale"),
+      tuneLength = 5
+    )
+  }
+  
+  # Entrenamos un SVM con kernel radial
+  else if (metodo == "SVM_radial") {
+    modelo <- train(
+      x = x_train,
+      y = y_train,
+      method = "svmRadial",
+      trControl = ctrl,
+      preProcess = c("center", "scale"),
+      tuneLength = 5
+    )
+  }
+  
+  # Entrenamos un modelo KNN
+  else if (metodo == "KNN") {
+    modelo <- train(
+      x = x_train,
+      y = y_train,
+      method = "knn",
+      trControl = ctrl,
+      preProcess = c("center", "scale"),
+      tuneLength = 10
+    )
+  }
+  
+  # Entrenamos un Random Forest
+  else if (metodo == "RF") {
+    modelo <- train(
+      x = x_train,
+      y = y_train,
+      method = "rf",
+      trControl = ctrl,
+      tuneLength = 5,
+      ntree = 500
+    )
+  }
+  
+  # Entrenamos un modelo de análisis discriminante lineal
+  else if (metodo == "LDA") {
+    modelo <- train(
+      x = x_train,
+      y = y_train,
+      method = "lda",
+      trControl = ctrl,
+      preProcess = c("center", "scale")
+    )
+  }
+  
+  # Devolvemos el modelo entrenado
+  return(modelo)
+}
+```
+
+```{r}
+# Función para evaluar un modelo entrenado sobre el conjunto de test
+evaluar_modelo <- function(modelo, x_test, y_test) {
+  
+  # Convertimos el conjunto test a data frame
+  x_test <- as.data.frame(x_test, check.names = FALSE)
+  
+  # Aseguramos que la variable real del test tiene los mismos niveles
+  y_test <- factor(y_test, levels = c("G1", "G2", "G3"))
+  
+  # Obtenemos las predicciones del modelo sobre el conjunto test
+  pred <- predict(modelo, newdata = x_test)
+  
+  # Aseguramos que las predicciones tienen los mismos niveles que la variable real
+  pred <- factor(pred, levels = c("G1", "G2", "G3"))
+  
+  # Calculamos la matriz de confusión
+  cm <- confusionMatrix(pred, y_test)
+  
+  # Calculamos la Balanced Accuracy media entre clases ya que están desbalanceadas
+  if (is.matrix(cm$byClass)) {
+    bal_acc <- mean(cm$byClass[, "Balanced Accuracy"], na.rm = TRUE)
+  } else {
+    bal_acc <- unname(cm$byClass["Balanced Accuracy"])
+  }
+  
+  # Calculamos la Macro-F1 usando la función definida anteriormente
+  f1 <- macro_f1(cm)
+  
+  # Extraemos el rendimiento medio obtenido durante la validación cruzada
+  perf_cv <- getTrainPerf(modelo)
+  
+  # Devolvemos las métricas principales del modelo
+  data.frame(
+    CV_Accuracy = perf_cv$TrainAccuracy,
+    CV_Kappa = perf_cv$TrainKappa,
+    Test_Accuracy = unname(cm$overall["Accuracy"]),
+    Test_Kappa = unname(cm$overall["Kappa"]),
+    Test_Balanced_Accuracy = bal_acc,
+    Test_Macro_F1 = f1
+  )
+}
+```
+
+## Clasificación
+
+```{r}
+# Definimos los modelos de clasificación que vamos a comparar
+modelos_a_probar <- c(
+  "SVM_lineal",
+  "SVM_radial",
+  "KNN",
+  "RF", 
+  "LDA"
+)
+
+# Creamos listas vacías para guardar los resultados y los modelos entrenados
+resultados_lista <- list()
+modelos_entrenados <- list()
+
+# Creamos un contador para almacenar los resultados de cada combinación
+contador <- 1
+
+# Recorremos cada conjunto de probesets obtenido en la fase de selección
+for (nombre_grupo in names(lista_probesets)) {
+  
+  # Extraemos los probesets correspondientes al grupo actual
+  probesets_actuales <- lista_probesets[[nombre_grupo]]
+  
+  # Nos aseguramos de conservar solo probesets presentes en train y test filtrados
+  probesets_actuales <- intersect(probesets_actuales, colnames(expr_train_corr))
+  probesets_actuales <- intersect(probesets_actuales, colnames(expr_test_corr))
+  
+  # Creamos los conjuntos de entrenamiento y test
+  x_train <- expr_train_corr[, probesets_actuales, drop = FALSE]
+  x_test  <- expr_test_corr[, probesets_actuales, drop = FALSE]
+  
+  # Recorremos cada modelo de clasificación
+  for (metodo in modelos_a_probar) {
+    
+    # Entrenamos dentro de tryCatch para que un error no detenga todo el análisis
+    modelo <- tryCatch(
+      entrenar_modelo(x_train, grade_train, metodo, seed = seed),
+      error = function(e) NULL
+    )
+    
+    # Si el modelo se entrena correctamente, lo evaluamos sobre el conjunto de test
+    if (!is.null(modelo)) {
+      
+      # Creamos un identificador único para la combinación
+      id_modelo <- paste(nombre_grupo, metodo, sep = "__")
+      
+      # Guardamos el modelo entrenado
+      modelos_entrenados[[id_modelo]] <- modelo
+      
+      # Evaluamos el modelo sobre el conjunto de test
+      metricas <- evaluar_modelo(modelo, x_test, grade_test)
+      
+      # Guardamos las métricas de esta combinación
+      resultados_lista[[contador]] <- data.frame(
+        grupo_probesets = nombre_grupo,
+        grupo_metodo = grupo_metodo[nombre_grupo],
+        modelo = metodo,
+        n_probesets = length(probesets_actuales),
+        metricas,
+        row.names = NULL
+      )
+      
+      # Actualizamos el contador
+      contador <- contador + 1
+    }
+  }
+}
+```
+
+```{r}
+# Unimos todos los resultados en una única tabla
+tabla_comparacion <- do.call(rbind, resultados_lista)
+
+# Ordenamos la tabla priorizando Macro-F1, Balanced Accuracy y Accuracy en test
+tabla_comparacion <- tabla_comparacion[
+  order(
+    tabla_comparacion$Test_Macro_F1,
+    tabla_comparacion$Test_Balanced_Accuracy,
+    tabla_comparacion$Test_Accuracy,
+    decreasing = TRUE
+  ),
+]
+```
+
+```{r}
+# Mostramos la tabla final de comparación
+head(tabla_comparacion)
+```
+
+```{r}
+# Extraemos la primera fila de la tabla
+mejor_resultado <- tabla_comparacion[1, ]
+mejor_resultado
+```
+
+Mostramos los 15 primeros probesets de la firma LASSO y su símbolo
+génico asociado.
+
+```{r tabla_top15_probesets_lasso}
+# Seleccionamos los 15 primeros probesets de la firma LASSO
+top15_probesets <- head(ps_lasso_100, 15)
+
+# Obtenemos la anotación de la plataforma GPL96
+anotacion_gpl96 <- Biobase::fData(gpl96_GSE4922)
+
+# Creamos una tabla con el probeset y el gen asociado
+tabla_top15_probesets <- data.frame(
+  Probeset = top15_probesets,
+  Gene_Symbol = anotacion_gpl96[
+    match(top15_probesets, anotacion_gpl96$ID),
+    "Gene Symbol"
+  ],
+  row.names = NULL
+)
+
+# Mostramos la tabla como data frame
+tabla_top15_probesets
+```
+
+```{r}
+# Creamos el identificador del mejor modelo
+id_mejor_modelo <- paste(
+  mejor_resultado$grupo_probesets,
+  mejor_resultado$modelo,
+  sep = "__"
+)
+
+# Recuperamos el modelo entrenado correspondiente a la mejor combinación
+mejor_modelo <- modelos_entrenados[[id_mejor_modelo]]
+
+# Recuperamos los probesets utilizados por el mejor modelo
+mejores_probesets <- lista_probesets[[mejor_resultado$grupo_probesets]]
+
+# Nos aseguramos de conservar solo probesets presentes en el conjunto de test filtrado
+mejores_probesets <- intersect(mejores_probesets, colnames(expr_test_corr))
+
+# Construimos el conjunto de test usando únicamente los probesets del mejor modelo
+x_test_mejor <- expr_test_corr[, mejores_probesets, drop = FALSE]
+
+# Obtenemos las predicciones del mejor modelo sobre el conjunto de test
+pred_mejor <- predict(
+  mejor_modelo,
+  newdata = as.data.frame(x_test_mejor, check.names = FALSE)
+)
+
+# Aseguramos que las predicciones conservan los mismos niveles que la variable real
+pred_mejor <- factor(pred_mejor, levels = c("G1", "G2", "G3"))
+
+# Calculamos la matriz de confusión del mejor modelo
+cm_mejor <- confusionMatrix(pred_mejor, grade_test)
+cm_mejor
+```
+
+# Validación externa
+
+Una vez seleccionado el mejor modelo a partir del conjunto de test
+interno, se evalúa su capacidad de generalización sobre el conjunto
+externo GSE2990. Para ello, se utilizan los mismos probesets empleados
+por el mejor modelo y se aplican directamente sobre la matriz de
+validación externa previamente corregida mediante ComBat y filtrada de
+forma equivalente al conjunto de train.
+
+```{r validacion_externa}
+# Recuperamos los probesets utilizados por el mejor modelo
+mejores_probesets_ext <- lista_probesets[[mejor_resultado$grupo_probesets]]
+
+# Nos aseguramos de conservar solo probesets presentes en la validación externa filtrada
+mejores_probesets_ext <- intersect(
+  mejores_probesets_ext,
+  colnames(expr_validacion_externa_corr)
+)
+
+# Construimos el conjunto externo usando únicamente los probesets del mejor modelo
+x_externo_mejor <- expr_validacion_externa_corr[, mejores_probesets_ext, drop = FALSE]
+
+# Obtenemos las predicciones del mejor modelo sobre la validación externa
+pred_externo <- predict(
+  mejor_modelo,
+  newdata = as.data.frame(x_externo_mejor, check.names = FALSE)
+)
+
+# Aseguramos que las predicciones conservan los mismos niveles que la variable real
+pred_externo <- factor(
+  pred_externo,
+  levels = c("G1", "G2", "G3")
+)
+
+# Aseguramos que la variable real externa conserva los mismos niveles
+grade_validacion_externa <- factor(
+  grade_validacion_externa,
+  levels = c("G1", "G2", "G3")
+)
+
+# Calculamos la matriz de confusión en validación externa
+cm_externo <- confusionMatrix(
+  pred_externo,
+  grade_validacion_externa
+)
+
+# Mostramos la matriz de confusión externa
+cm_externo
+```
